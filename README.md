@@ -29,12 +29,18 @@ SAVE_TOPK=1 SAVE_REF_LOGITS=1 K_SAVE=10 SET_METHOD=N1 \
 bash scripts/qwen3-4b/train.sh magicoder lp_sft          # default LP_SFT_MU=0.03
 ```
 
-Smoke test (one GPU; excludes `asft` — needs ~2× model memory):
+**Smoke test** (one GPU; Qwen3-4B × magicoder):
+
+```bash
+LOSS=lp_sft bash scripts/smoke_test.sh
+```
+
+Full list: env vars at the top of [`scripts/train.sh`](scripts/train.sh) and [`scripts/precompute_R.sh`](scripts/precompute_R.sh).
+
+To smoke-test all losses (baselines + `lp_sft`; `asft` excluded — needs ~2× VRAM):
 
 ```bash
 bash scripts/smoke_test_all.sh
-# ASFT smoke (multi-GPU or large VRAM recommended):
-LOSSES="asft" bash scripts/smoke_test_all.sh
 ```
 
 ## Installation
