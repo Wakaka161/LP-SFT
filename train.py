@@ -97,31 +97,12 @@ class TrainingArguments(transformers.TrainingArguments):
                           "'none' => mu, 'R' => mu*R_t, 'R2' => mu*R_t^2, "
                           "'R3' => mu*R_t^3."}
     )
-    lp_sft_set_label_mode: str = field(
-        default="union_label",
-        metadata={"help": "How to form S_t' for the in-set alignment term: "
-                          "'union_label' => S_t union {y_t} (legacy default); "
-                          "'minus_label' => S_t \\ {y_t} (alternative-only alignment); "
-                          "'minus_anchor' => S_t union {y_t} but stop-grad the student "
-                          "logit at y_t (alternative-only gradient, y_t kept as a "
-                          "detached anchor; avoids the |S_t\\'|==1 degeneracy with no "
-                          "extra hyper-parameter); "
-                          "'minusY_min2' => S_t \\ {y_t} but extend beyond k_t within "
-                          "K_save to ensure at least 2 non-label tokens (also expands "
-                          "S_t={y_t} positions using low-probability rank-2/3 tokens); "
-                          "'minusY_min2_strict' => same as minusY_min2 but skips "
-                          "S_t={y_t} positions (set_size_minus==0): those get L_lp_sft=0, "
-                          "only expands when there is exactly 1 genuine non-label alt; "
-                          "'minusY_union_fallback' => S_t \\ {y_t} normally, but when "
-                          "|S_t|==2 and y_t in S_t, keep S_t unchanged to avoid the "
-                          "common {y_t, v} -> single-token degeneration."}
-    )
     lp_sft_mode: str = field(
         default="additive",
         metadata={"help": "Loss combination mode for lp_sft: "
                           "'additive' => CE + mu_t * L_set (original); "
                           "'r_interp' => (1-R_t)*CE + R_t*L_set (convex interpolation). "
-                          "r_interp forces set_label_mode=union_label and ignores mu/r_weight."}
+                          "r_interp ignores mu/r_weight."}
     )
     lp_sft_set_method: str = field(
         default="N2",
@@ -163,12 +144,6 @@ class TrainingArguments(transformers.TrainingArguments):
         default=0.05,
         metadata={"help": "ASFT KL-anchor strength lambda. Paper uses 0.05; "
                           "0.03 recommended under bf16 mixed precision."}
-    )
-    asft_reduction: str = field(
-        default="sum_div_num_items",
-        metadata={"help": "ASFT loss reduction: sum_div_num_items (HF Trainer) "
-                          "or mean_over_valid (paper).",
-                  "choices": ["sum_div_num_items", "mean_over_valid"]}
     )
     asft_ref_model_path: str = field(
         default=None,
@@ -397,7 +372,7 @@ def main():
             tokenizer.pad_token_id = len(tokenizer) - 1
             tokenizer.pad_token = tokenizer.decode(tokenizer.pad_token_id)
         elif tokenizer.eos_token is not None:
-            # DeepSeek-Math 等 base 模型无 pad_token, 用 eos 即可
+            # 部分 base 模型无 pad_token, 用 eos 即可
             tokenizer.pad_token = tokenizer.eos_token
             tokenizer.pad_token_id = tokenizer.eos_token_id
 

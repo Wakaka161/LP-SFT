@@ -59,14 +59,14 @@ If `flash-attn` fails to build, install the rest first, then either skip it (`US
 | `dft` | No | No | ZeRO-2 |
 | `eaft` | No | No | ZeRO-2 |
 | `gem` | No | No | ZeRO-2 |
-| `asft` | No | **Yes** (live forward) | ZeRO-3 |
+| `asft` | No | **Yes** (live forward; full-vocab KL, DFT first term) | ZeRO-3 |
 | `lp_sft` | **Yes** | No (cached ref logits) | ZeRO-2 |
 
 ```bash
 bash scripts/<model>/train.sh <dataset> <loss>
 ```
 
-Other backbones: `qwen3-14b`, `llama3.1` — same pattern under `scripts/`.
+`scripts/qwen3-4b/`、`scripts/qwen3-14b/`、`scripts/llama3.1/` 为各模型薄封装。
 
 Key env vars: `LP_SFT_MU` (default `0.03`), `ASFT_KL_WEIGHT` (default `0.05`).
 
@@ -79,12 +79,6 @@ Key env vars: `LP_SFT_MU` (default `0.03`), `ASFT_KL_WEIGHT` (default `0.05`).
 | [`ckpts/`](ckpts/README.md) | Training outputs |
 
 Override paths: `export MODELS_DIR=... DATA_DIR=... CKPT_DIR=...` before `source activate_lp_sft.sh`.
-
-## Tests
-
-```bash
-python losses/test_asft_loss.py
-```
 
 ## Acknowledgements
 

@@ -18,8 +18,6 @@ Example:
 huggingface-cli download Qwen/Qwen3-4B-Base --local-dir models/Qwen3-4B-Base
 ```
 
-`scripts/train.sh` also accepts other `MODEL_TAG` values (e.g. `gemma3-12b`) via env override, but only the three wrappers above are maintained in this repo.
-
 ## Custom location
 
 ```bash

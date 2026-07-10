@@ -20,8 +20,6 @@
 #   LP_SFT_MU=0.03           → lp_sft 第二项权重 (默认 0.03, 推荐扫 {0.01,0.03,0.05,0.1})
 #   LP_SFT_TAU=1.0           → lp_sft reference 温度 (默认 1.0, 第一阶段固定; 后续可扫 {1.0,1.5,2.0})
 #   LP_SFT_R_WEIGHT=none|R|R2|R3 → lp_sft 第二项权重: mu, mu*R_t, mu*R_t^2, 或 mu*R_t^3 (默认 none)
-#   LP_SFT_SET_LABEL_MODE=union_label|minus_label|minus_anchor → S_t' = S_t∪{y_t} (默认) /
-#                                  S_t\{y_t} / S_t∪{y_t} 但 stop-grad y_t 学生 logit (无超参救退化)
 #   LP_SFT_SET_METHOD=N2|N1        → 训练时从 cache 读 k_n2 (默认) 或 k_n1
 #                                   precompute 请用 SET_METHOD=N1 (文件名带 _setN1)
 #   LP_SFT_K_ROUND_MODE=precomputed|round|ceil|floor
@@ -114,8 +112,6 @@ fi
 
 # ---------- 环境检查 ----------
 export FLASH_ATTENTION_DETERMINISTIC="${FLASH_ATTENTION_DETERMINISTIC:-1}"
-# 防止大模型（如 Gemma-3-12B）因显存碎片化导致 OOM
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 : "${MODELS_DIR:?ERROR: please 'source activate_lp_sft.sh' first}"
 : "${DATA_DIR:?ERROR: please 'source activate_lp_sft.sh' first}"
@@ -126,9 +122,6 @@ case "$MODEL_TAG" in
     qwen3-4b)    MODEL_NAME_OR_PATH="$MODELS_DIR/Qwen3-4B-Base" ;;
     qwen3-14b)   MODEL_NAME_OR_PATH="$MODELS_DIR/Qwen3-14B-Base" ;;
     llama3.1-8b) MODEL_NAME_OR_PATH="$MODELS_DIR/Llama-3.1-8B" ;;
-    gemma3-12b)        MODEL_NAME_OR_PATH="$MODELS_DIR/Gemma-3-12B-Base" ;;
-    gemma2-9b)         MODEL_NAME_OR_PATH="$MODELS_DIR/Gemma-2-9B" ;;
-    deepseek-math-7b)  MODEL_NAME_OR_PATH="$MODELS_DIR/DeepSeek-Math-7B-Base" ;;
     *) MODEL_NAME_OR_PATH="$MODELS_DIR/$MODEL_TAG" ;;
 esac
 # Warm-start override: MODEL_NAME_OR_PATH_OVERRIDE 可指向任意 checkpoint 目录 (如 1ep SFT ckpt).
@@ -138,14 +131,7 @@ if [ -n "${MODEL_NAME_OR_PATH_OVERRIDE:-}" ]; then
     MODEL_NAME_OR_PATH="$MODEL_NAME_OR_PATH_OVERRIDE"
 fi
 
-# Gemma3 不支持 flash_attention_2 (sliding window attention 兼容问题),
-# 官方推荐使用 eager. 其他模型默认 flash_attention_2.
-if [ "${USE_FLASH_ATTN:-}" = "" ]; then
-    case "$MODEL_TAG" in
-        gemma3-*|gemma2-*) USE_FLASH_ATTN="false" ;;
-        *)        USE_FLASH_ATTN="true"  ;;
-    esac
-fi
+USE_FLASH_ATTN="${USE_FLASH_ATTN:-true}"
 [ -f "$MODEL_NAME_OR_PATH/config.json" ] || { echo "ERROR: model not found at $MODEL_NAME_OR_PATH" >&2; exit 1; }
 [ -f "$TRAIN_FILE" ] || { echo "ERROR: train file not found at $TRAIN_FILE" >&2; exit 1; }
 
@@ -155,10 +141,6 @@ if [ -z "${ASFT_REF_MODEL_PATH:-}" ]; then
         qwen3-4b)    ASFT_REF_MODEL_PATH="$MODELS_DIR/Qwen3-4B-Base" ;;
         qwen3-14b)   ASFT_REF_MODEL_PATH="$MODELS_DIR/Qwen3-14B-Base" ;;
         llama3.1-8b) ASFT_REF_MODEL_PATH="$MODELS_DIR/Llama-3.1-8B" ;;
-        gemma3-12b)  ASFT_REF_MODEL_PATH="$MODELS_DIR/Gemma-3-12B-Base" ;;
-        gemma2-9b)   ASFT_REF_MODEL_PATH="$MODELS_DIR/Gemma-2-9B" ;;
-        deepseek-math-7b) ASFT_REF_MODEL_PATH="$MODELS_DIR/DeepSeek-Math-7B-Base" ;;
-        *) ASFT_REF_MODEL_PATH="$MODEL_NAME_OR_PATH" ;;
     esac
 fi
 if [ "$LOSS" = "asft" ]; then
@@ -211,7 +193,6 @@ GEM_BETA="${GEM_BETA:-0.7}"
 
 # ---------- ASFT 超参 (Zhu et al. ICLR 2026) ----------
 ASFT_KL_WEIGHT="${ASFT_KL_WEIGHT:-0.05}"
-ASFT_REDUCTION="${ASFT_REDUCTION:-sum_div_num_items}"
 
 # ---------- lp_sft cache K_save ----------
 PLATEAU_K_SAVE="${PLATEAU_K_SAVE:-10}"
@@ -245,19 +226,8 @@ case "$LP_SFT_MODE" in
     additive|r_interp) ;;
     *) echo "ERROR: LP_SFT_MODE must be additive or r_interp, got $LP_SFT_MODE" >&2; exit 1 ;;
 esac
-LP_SFT_SET_LABEL_MODE="${LP_SFT_SET_LABEL_MODE:-union_label}"
-case "$(echo "$LP_SFT_SET_LABEL_MODE" | tr '[:upper:]' '[:lower:]')" in
-    union_label)           LP_SFT_SET_LABEL_MODE="union_label" ;;
-    minus_label)           LP_SFT_SET_LABEL_MODE="minus_label" ;;
-    minus_anchor)          LP_SFT_SET_LABEL_MODE="minus_anchor" ;;
-    minusy_min2)           LP_SFT_SET_LABEL_MODE="minusY_min2" ;;
-    minusy_min2_strict)    LP_SFT_SET_LABEL_MODE="minusY_min2_strict" ;;
-    minusy_union_fallback) LP_SFT_SET_LABEL_MODE="minusY_union_fallback" ;;
-    *) echo "ERROR: LP_SFT_SET_LABEL_MODE must be union_label, minus_label, minus_anchor, minusY_min2, minusY_min2_strict, or minusY_union_fallback, got $LP_SFT_SET_LABEL_MODE" >&2; exit 1 ;;
-esac
 
 # ---------- EAFT baseline 超参 ----------
-# alpha: power of adaptive weight w_t=(H~_t)^alpha (1=EAFT, 2=EAFT2, 3=EAFT3). 论文默认 1.0.
 # k:     top-K for entropy approx (上游硬编码 20). 无需 cache / ref model.
 EAFT_ALPHA="${EAFT_ALPHA:-1.0}"
 EAFT_K="${EAFT_K:-20}"
@@ -267,11 +237,8 @@ if [ -z "${R_BASE_MODEL:-}" ]; then
     case "$MODEL_TAG" in
         qwen3-4b)    R_BASE_MODEL="qwen3_4b_base" ;;
         qwen3-14b)   R_BASE_MODEL="qwen3_14b_base" ;;
-        llama3.1-8b)       R_BASE_MODEL="llama3_1_8b_base" ;;
-        gemma2-9b)         R_BASE_MODEL="gemma2_9b_base" ;;
-        gemma3-12b)        R_BASE_MODEL="gemma3_12b_base" ;;
-        deepseek-math-7b)  R_BASE_MODEL="deepseek_math_7b_base" ;;
-        *)                 R_BASE_MODEL="${MODEL_TAG//-/_}_base" ;;
+        llama3.1-8b) R_BASE_MODEL="llama3_1_8b_base" ;;
+        *) R_BASE_MODEL="${MODEL_TAG//-/_}_base" ;;
     esac
 fi
 if [ "$USE_LP_SFT_CACHE" = "1" ]; then
@@ -322,17 +289,6 @@ elif [ "$LOSS" = "lp_sft" ]; then
     if [ "$LP_SFT_SET_METHOD" = "N1" ]; then
         LOSS_TAG="${LOSS_TAG}_setN1"
     fi
-    if [ "$LP_SFT_SET_LABEL_MODE" = "minus_label" ]; then
-        LOSS_TAG="${LOSS_TAG}_minusY"
-    elif [ "$LP_SFT_SET_LABEL_MODE" = "minusY_min2" ]; then
-        LOSS_TAG="${LOSS_TAG}_minusY_min2"
-    elif [ "$LP_SFT_SET_LABEL_MODE" = "minusY_min2_strict" ]; then
-        LOSS_TAG="${LOSS_TAG}_minusY_min2s"
-    elif [ "$LP_SFT_SET_LABEL_MODE" = "minusY_union_fallback" ]; then
-        LOSS_TAG="${LOSS_TAG}_minusY_unionfb"
-    elif [ "$LP_SFT_SET_LABEL_MODE" = "minus_anchor" ]; then
-        LOSS_TAG="${LOSS_TAG}_minusYanc"
-    fi
     if [ -n "$LP_SFT_K_THRESHOLD" ] && [ "$LP_SFT_K_THRESHOLD" != "0" ]; then
         _thr_gt=$(python3 -c "print(1 if float('$LP_SFT_K_THRESHOLD')>1.0 else 0)" 2>/dev/null || echo "$(echo "$LP_SFT_K_THRESHOLD > 1.0" | bc -l 2>/dev/null || echo 0)")
         if [ "$_thr_gt" = "1" ]; then
@@ -341,9 +297,6 @@ elif [ "$LOSS" = "lp_sft" ]; then
     fi
 elif [ "$LOSS" = "asft" ]; then
     LOSS_TAG="_kl${ASFT_KL_WEIGHT}"
-    if [ "$ASFT_REDUCTION" != "sum_div_num_items" ]; then
-        LOSS_TAG="${LOSS_TAG}_${ASFT_REDUCTION}"
-    fi
     if [ "$ASFT_REF_TOPK" != "0" ]; then
         LOSS_TAG="${LOSS_TAG}_reftopk${ASFT_REF_TOPK}"
     fi
@@ -373,7 +326,6 @@ if [ "$LOSS" = "gem" ]; then
 fi
 if [ "$LOSS" = "asft" ]; then
     echo "[train] asft_kl_weight = $ASFT_KL_WEIGHT"
-    echo "[train] asft_reduction = $ASFT_REDUCTION"
     echo "[train] asft_ref_model = $ASFT_REF_MODEL_PATH"
     echo "[train] asft_ref_topk  = $ASFT_REF_TOPK (0 = full vocab)"
     echo "[train] note           = L = DFT + lambda * KL(pi_ref || pi_theta); live ref forward, no cache."
@@ -383,23 +335,13 @@ if [ "$LOSS" = "lp_sft" ]; then
     echo "[train] lp_sft_tau     = $LP_SFT_TAU (ref temperature for q_ref^S)"
     echo "[train] lp_sft_r_weight= $LP_SFT_R_WEIGHT (none: mu; R: mu*R_t; R2: mu*R_t^2; R3: mu*R_t^3)"
     echo "[train] lp_sft_mode     = $LP_SFT_MODE (additive: CE+mu*L_set; r_interp: (1-R)*CE+R*L_set)"
-    echo "[train] lp_sft_set_label_mode= $LP_SFT_SET_LABEL_MODE"
+    echo "[train] lp_sft_set        = S_t \\ {y_t}; |S'|==1 → add top-1 ref alt from cache"
     echo "[train] lp_sft_set_method    = $LP_SFT_SET_METHOD (k_t = clamp($LP_SFT_K_ROUND_MODE($LP_SFT_SET_METHOD), 1, K))"
     echo "[train] lp_sft_k_round_mode  = $LP_SFT_K_ROUND_MODE"
     echo "[train] lp_sft_k_threshold   = $LP_SFT_K_THRESHOLD  (>1.0: n<T→k=1, else ceil)"
     echo "[train] plateau_K_save      = $PLATEAU_K_SAVE  (cache size, |S_t| upper bound)"
     echo "[train] cache               = $R_CACHE_PATH"
-    if [ "$LP_SFT_SET_LABEL_MODE" = "minus_label" ]; then
-        echo "[train] note                = L = CE(y_t) + mu * H(q_ref^S, p_theta^S) on S_t' = S_t \\ {y_t}."
-    elif [ "$LP_SFT_SET_LABEL_MODE" = "minusY_min2" ]; then
-        echo "[train] note                = L = CE(y_t) + mu * H(q_ref^S, p_theta^S) on S_t' = S_t \\ {y_t}, min 2 non-label tokens."
-    elif [ "$LP_SFT_SET_LABEL_MODE" = "minusY_union_fallback" ]; then
-        echo "[train] note                = L = CE(y_t) + mu * H(q_ref^S, p_theta^S); fallback to S_t (keep y_t) when |S_t|==2 and y_t in S_t."
-    elif [ "$LP_SFT_SET_LABEL_MODE" = "minus_anchor" ]; then
-        echo "[train] note                = L = CE(y_t) + mu * H(q_ref^S, p_theta^S) on S_t' = S_t ∪ {y_t}, y_t 学生 logit stop-grad."
-    else
-        echo "[train] note                = L = CE(y_t) + mu * H(q_ref^S, p_theta^S) on S_t' = S_t ∪ {y_t}."
-    fi
+    echo "[train] note                = L = CE(y_t) + mu * H(q_ref^S, p_theta^S) on S_t' = S_t \\ {y_t}."
     echo "                              q_ref^S is the ref model's softmax restricted to S_t' (with tau)."
 fi
 if [ "$LOSS" = "eaft" ]; then
@@ -422,7 +364,6 @@ if [ "$LOSS" = "gem" ]; then
 fi
 if [ "$LOSS" = "asft" ]; then
     OPT_ARGS+=(--asft_kl_weight "$ASFT_KL_WEIGHT"
-               --asft_reduction "$ASFT_REDUCTION"
                --asft_ref_topk "$ASFT_REF_TOPK"
                --asft_ref_model_path "$ASFT_REF_MODEL_PATH")
 fi
@@ -432,7 +373,6 @@ if [ "$LOSS" = "lp_sft" ]; then
     OPT_ARGS+=(--lp_sft_mu "$LP_SFT_MU"
                --lp_sft_tau "$LP_SFT_TAU"
                --lp_sft_r_weight "$LP_SFT_R_WEIGHT"
-               --lp_sft_set_label_mode "$LP_SFT_SET_LABEL_MODE"
                --lp_sft_mode "$LP_SFT_MODE"
                --lp_sft_set_method "$LP_SFT_SET_METHOD"
                --lp_sft_k_round_mode "$LP_SFT_K_ROUND_MODE"

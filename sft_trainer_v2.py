@@ -129,14 +129,13 @@ class SFTTrainer(Trainer):
                                 ref_topk_logits, ref_label_logit,
                                 num_items_in_batch, renyi_R=None,
                                 mu=0.03, tau=1.0, r_weight="none",
-                                set_label_mode="union_label",
                                 K_save=10, ignore_index=-100,
                                 loss_mode="additive"):
         """Precomputed LP-SFT (lp_sft). See losses/lp_sft_loss.py.
 
+        S_t' = S_t \\ {y_t}; when |S'|==1, add the single highest-ref-prob alt.
         Loss = CE(student, y_t) + mu * H(q_ref^S, p_theta^S)  (additive)
            or (1-R_t)*CE + R_t*H(q_ref^S, p_theta^S)          (r_interp)
-        where q_ref^S is the reference model's softmax(z_ref/tau) restricted to S_t'.
         """
         return _lp_sft_loss_fn(
             logits=logits, labels=labels,
@@ -147,7 +146,6 @@ class SFTTrainer(Trainer):
             renyi_R=renyi_R,
             num_items_in_batch=num_items_in_batch,
             mu=mu, tau=tau, r_weight=r_weight,
-            set_label_mode=set_label_mode,
             K_save=K_save,
             ignore_index=ignore_index,
             loss_mode=loss_mode,
@@ -169,13 +167,13 @@ class SFTTrainer(Trainer):
         )
 
     def asft_loss(self, logits, labels, ref_logits, num_items_in_batch,
-                  kl_weight=0.05, reduction="sum_div_num_items", ignore_index=-100,
+                  kl_weight=0.05, ignore_index=-100,
                   return_diagnostics=False, ref_topk=None):
         """ASFT (Anchored SFT) — Zhu et al. ICLR 2026. See losses/asft_loss.py."""
         return _asft_loss_fn(
             logits=logits, labels=labels, ref_logits=ref_logits,
             num_items_in_batch=num_items_in_batch,
-            kl_weight=kl_weight, reduction=reduction,
+            kl_weight=kl_weight,
             ignore_index=ignore_index,
             return_diagnostics=return_diagnostics,
             ref_topk=ref_topk,
@@ -254,9 +252,6 @@ class SFTTrainer(Trainer):
                         "and use DataCollatorForSFTWithRefAlign?"
                     )
                 _r_weight = str(getattr(self.args, "lp_sft_r_weight", "none")).lower()
-                _set_label_mode = str(
-                    getattr(self.args, "lp_sft_set_label_mode", "union_label")
-                ).lower()
                 if _r_weight != "none" and renyi_R is None:
                     raise ValueError(
                         "loss=lp_sft with --lp_sft_r_weight != none "
@@ -277,7 +272,6 @@ class SFTTrainer(Trainer):
                     mu=self.args.lp_sft_mu,
                     tau=self.args.lp_sft_tau,
                     r_weight=_r_weight,
-                    set_label_mode=_set_label_mode,
                     K_save=self.args.plateau_K_save,
                     loss_mode=_loss_mode,
                 )
@@ -293,7 +287,6 @@ class SFTTrainer(Trainer):
                         mu=self.args.lp_sft_mu,
                         tau=self.args.lp_sft_tau,
                         r_weight=_r_weight,
-                        set_label_mode=_set_label_mode,
                         K_save=self.args.plateau_K_save,
                         loss_mode=_loss_mode,
                     )
@@ -353,7 +346,6 @@ class SFTTrainer(Trainer):
                         ref_logits=ref_logits,
                         num_items_in_batch=num_items_in_batch,
                         kl_weight=self.args.asft_kl_weight,
-                        reduction=self.args.asft_reduction,
                         return_diagnostics=True,
                         ref_topk=_asft_ref_topk,
                     )
@@ -365,7 +357,6 @@ class SFTTrainer(Trainer):
                         ref_logits=ref_logits,
                         num_items_in_batch=num_items_in_batch,
                         kl_weight=self.args.asft_kl_weight,
-                        reduction=self.args.asft_reduction,
                         ref_topk=_asft_ref_topk,
                     )
                     self._pending_plateau_diag = {}

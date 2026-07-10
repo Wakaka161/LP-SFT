@@ -10,8 +10,7 @@ Per-token loss:
             = - sum_{v in S_t'} q_ref^S(v) * log p_theta^S(v)      # "soft-label CE" inside S_t'
 
     mu_t        = mu, mu * R_t, mu * R_t^2, or mu * R_t^3 depending on r_weight
-    S_t'        = S_t union {y_t}  (set_label_mode=union_label, default)
-                or S_t \\ {y_t}    (set_label_mode=minus_label)
+    S_t'        = S_t \\ {y_t}  (alternative-only alignment; y_t never in the in-set term)
     p_theta^S(v) = softmax over student logits restricted to S_t'
     q_ref^S(v)  = softmax over reference logits restricted to S_t', with temperature tau:
                   q_ref^S(v) = exp(z_ref(v)/tau) / sum_{u in S_t'} exp(z_ref(u)/tau)
@@ -38,59 +37,28 @@ S_t' CONSTRUCTION (vectorised, no per-sample Python loop)
 ================================================================================
 
 For each valid token t we have precomputed:
-    S_ids[t]:           top-K_save ref ids (sorted desc by ref prob), padded with 0 beyond k_t
+    S_ids[t]:           top-K_save ref ids (sorted desc by ref prob), padded beyond k_t
     S_ref_logits[t]:    ref logits at S_ids[t] (sorted desc by ref logit)
     k[t]:               actual set size in [1, K_save]
-    label_ref_logit[t]: ref logit at the true label y_t
 
-We construct an *extended* buffer of width K_save + 1:
-    ext_ids[t]         = [S_ids[t, :K_save],         label_id]                 # [K_save+1]
-    ext_ref_logits[t]  = [S_ref_logits[t, :K_save],  label_ref_logit]          # [K_save+1]
+S_t' construction (fixed):
+    1. S_t' = S_t \\ {y_t}
+    2. If |S_t'| == 1 (exactly one non-label alt in S_t), add exactly ONE more token
+       from the K_save cache: the non-label candidate with the highest ref logit
+       (may be beyond k[t], i.e. rank-2/3… in the saved top-K_save list).
+    3. If S_t = {y_t} only (no genuine alternative), |S_t'| = 0 → L_set_t = 0.
 
-with a per-row valid mask:
-    valid[t, :K_save]  = (arange(K_save) < k[t])                               # first k slots are real
-    valid[t, K_save]   = NOT label_in_set[t]                                   # last slot only if label∉S_t
-
-union_label (default):
-    - if y_t already in S_t (label_in_set=True):  effective set = S_t,            |S_t'| = k[t]
-    - if y_t NOT  in S_t (label_in_set=False):    effective set = S_t ∪ {y_t},   |S_t'| = k[t] + 1
-
-minus_label (alternative-only alignment):
-    - S_t' = S_t \\ {y_t}; label is never included in the in-set term
-    - if y_t in S_t:  |S_t'| = k[t] - 1; else |S_t'| = k[t]
-
-minus_anchor (alternative alignment, y_t kept as a detached anchor):
-    - U_t = S_t ∪ {y_t} (same buffer as union_label) but the *student* logit at
-      the y_t slot is stop-grad, so the in-set term shapes only the alternatives
-      while y_t stays a fixed reference point. Avoids the |S_t'|==1 degeneracy of
-      minus_label without any extra hyper-parameter. See DEGENERATE CASES below.
+We use a K_save-wide buffer (no label extension column):
+    ext_ids[t]         = S_ids[t, :K_save]
+    ext_ref_logits[t]  = S_ref_logits[t, :K_save]
+    valid[t, j]        = j < k[t] and S_ids[t,j] != y_t, optionally plus one top-1 slot
 
 ================================================================================
 DEGENERATE CASES
 ================================================================================
 
-  |S_t'| <= 1:
-      The local distribution has no other entry to compare with y_t. We set
-      L_set_t = 0 explicitly. (Math also gives 0 because log_softmax over a
-      single live slot is 0 and ref_probs at that slot is 1, so 1*0=0.)
-
-  minus_anchor (anchored minus_label -- avoids the |S_t'|==1 degeneracy):
-      Pure minus_label drops y_t entirely, so a token whose only alternative is a
-      single v != y_t collapses to {v} and contributes 0. minus_anchor instead
-      KEEPS y_t in the local set (denominator) exactly like union_label, but
-      DETACHES the student logit at y_t so the in-set term never trains y_t:
-
-          U_t = S_t ∪ {y_t}
-          p_theta^U(v) = softmax_U([..., stop_grad(z_theta(y_t))])
-          q_ref^U      = softmax_U(z_ref/tau)
-          L_set_t      = - sum_{u in U_t} q_ref^U(u) log p_theta^U(u)
-
-      Because z_theta(y_t) is stop-grad, the gradient on each alternative a is the
-      clean CE gradient p_theta^U(a) - q_ref^U(a) and *nothing* flows into y_t (CE
-      term 1 alone owns y_t). A lone alternative now compares against the real,
-      fixed y_t anchor instead of degenerating. No extra hyper-parameter. |S_t'|==1
-      can still only happen here when S_t = {y_t} (no alternative at all), where 0
-      is the correct answer.
+  |S_t'| <= 1 (after optional top-1 expansion):
+      L_set_t = 0.  Typical when S_t = {y_t} and no extra alt is borrowed.
 
   ref_probs at invalid slots is 0 (masked softmax), and student log_probs at
   invalid slots is -inf, so we mask the contribution to 0 explicitly to avoid
@@ -124,6 +92,94 @@ import torch
 import torch.nn.functional as F
 
 
+_NEG_INF = float("-inf")
+
+
+def expand_with_top1_ref_alt(
+    valid_ext: torch.Tensor,
+    ext_ref_logits: torch.Tensor,
+    ext_ids: torch.Tensor,
+    labels_v: torch.Tensor,
+    *,
+    topk_width: int,
+    exclude_label: bool,
+    min_set_size: int = 2,
+    expand_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """When |S'| < min_set_size, enable exactly one extra top-k slot per row.
+
+  Picks the non-label candidate (among columns ``0:topk_width`` not yet in S')
+  with the highest reference logit from the precompute cache.  At most one token
+  is added per position — never multiple rank-2/3 slots at once.
+
+  Returns:
+      (updated valid_ext, picked_slot_or_None) where picked_slot is [N] long
+      with -1 where no expansion happened (for diagnostics).
+    """
+    set_size = valid_ext.sum(dim=-1)
+    needs = set_size < min_set_size
+    if expand_mask is not None:
+        needs = needs & expand_mask
+    if not needs.any():
+        return valid_ext, None
+
+    cand = ~valid_ext[:, :topk_width]
+    if exclude_label:
+        cand = cand & (ext_ids[:, :topk_width] != labels_v.unsqueeze(-1))
+
+    ref_scores = ext_ref_logits[:, :topk_width].clone()
+    ref_scores = ref_scores.masked_fill(~cand, _NEG_INF)
+    ref_scores = ref_scores.masked_fill(~needs.unsqueeze(-1), _NEG_INF)
+
+    best_idx = ref_scores.argmax(dim=-1)
+    best_score = ref_scores.gather(-1, best_idx.unsqueeze(-1)).squeeze(-1)
+    pick = needs & (best_score > _NEG_INF)
+
+    picked_slot = torch.full((valid_ext.size(0),), -1, dtype=torch.long, device=valid_ext.device)
+    if not pick.any():
+        return valid_ext, picked_slot
+
+    valid_ext = valid_ext.clone()
+    rows = torch.arange(valid_ext.size(0), device=valid_ext.device)
+    picked_slot[pick] = best_idx[pick]
+    valid_ext[rows[pick], best_idx[pick]] = True
+    return valid_ext, picked_slot
+
+
+def build_lp_sft_set_mask(
+    topk_ids_v: torch.Tensor,
+    ref_topk_lg_v: torch.Tensor,
+    labels_v: torch.Tensor,
+    k_v: torch.Tensor,
+    K_save: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Build S_t' = S_t \\ {y_t} with optional single top-1 ref expansion.
+
+    When |S_t'| == 1 after removing y_t, enable exactly one more non-label slot
+    from the K_save cache (highest ref logit).  When S_t = {y_t} only, no expansion.
+    """
+    device = topk_ids_v.device
+    pos = torch.arange(K_save, device=device).unsqueeze(0)
+    valid_top = pos < k_v.clamp(min=0).unsqueeze(-1)
+    valid_nonlabel = topk_ids_v != labels_v.unsqueeze(-1)
+    valid_minus = valid_top & valid_nonlabel
+    set_size_minus = valid_minus.sum(-1)
+
+    ext_ids = topk_ids_v
+    ext_ref_logits = ref_topk_lg_v.float()
+    valid_ext, picked_slot = expand_with_top1_ref_alt(
+        valid_minus,
+        ext_ref_logits,
+        ext_ids,
+        labels_v,
+        topk_width=K_save,
+        exclude_label=True,
+        min_set_size=2,
+        expand_mask=(set_size_minus == 1),
+    )
+    return ext_ids, ext_ref_logits, valid_ext, picked_slot
+
+
 # --------------------------------------------------------------------------------------
 # Main loss
 # --------------------------------------------------------------------------------------
@@ -139,7 +195,6 @@ def lp_sft_loss(
     mu: float = 0.03,
     tau: float = 1.0,
     r_weight: str = "none",                         # none | R | R2 | R3
-    set_label_mode: str = "union_label",            # union_label | minus_label | minus_anchor
     K_save: int = 10,
     ignore_index: int = -100,
     return_diagnostics: bool = False,
@@ -170,24 +225,11 @@ def lp_sft_loss(
         raise ValueError(f"r_weight must be one of none|R|R2|R3, got {r_weight}")
     if r_weight != "none" and renyi_R is None:
         raise ValueError("r_weight != none requires renyi_R to be provided")
-    set_label_mode = str(set_label_mode).lower()
-    _VALID_SET_LABEL_MODES = {
-        "union_label", "minus_label", "minus_anchor",
-        "minusy_min2", "minusy_min2_strict", "minusy_union_fallback",
-    }
-    if set_label_mode not in _VALID_SET_LABEL_MODES:
-        raise ValueError(
-            f"set_label_mode must be one of {sorted(_VALID_SET_LABEL_MODES)}, "
-            f"got {set_label_mode}"
-        )
     loss_mode = str(loss_mode).lower()
     if loss_mode not in {"additive", "r_interp"}:
         raise ValueError(f"loss_mode must be additive or r_interp, got {loss_mode}")
-    if loss_mode == "r_interp":
-        if set_label_mode != "union_label":
-            raise ValueError("loss_mode='r_interp' requires set_label_mode='union_label'")
-        if renyi_R is None:
-            raise ValueError("loss_mode='r_interp' requires renyi_R")
+    if loss_mode == "r_interp" and renyi_R is None:
+        raise ValueError("loss_mode='r_interp' requires renyi_R")
 
     # ---- shift for next-token prediction (logits[:, t] predicts labels[:, t+1]) ----
     shift_logits        = logits[..., :-1, :].contiguous()              # [B, L-1, V]
@@ -227,112 +269,33 @@ def lp_sft_loss(
     ).squeeze(-1)                                                         # [N]
     ce_per_token = -real_logp                                             # [N]
 
-    # ---- build S_t' mask ----
-    pos = torch.arange(K_save, device=device).unsqueeze(0)               # [1, K_save]
-    valid_top = pos < k_v.clamp(min=0).unsqueeze(-1)                     # [N, K_save]
-    match = (topk_ids_v == labels_v.unsqueeze(-1)) & valid_top           # [N, K_save]
-    label_in_set = match.any(dim=-1)                                     # [N]
+    # ---- build S_t' mask: S_t \ {y_t}, top-1 expand when |S'| == 1 ----
+    pos = torch.arange(K_save, device=device).unsqueeze(0)
+    valid_top = pos < k_v.clamp(min=0).unsqueeze(-1)
+    label_in_set = ((topk_ids_v == labels_v.unsqueeze(-1)) & valid_top).any(dim=-1)
 
-    # For the new K_save-wide modes we track mode-specific extras for diagnostics.
-    _min2_needs_expansion: Optional[torch.Tensor] = None
-    _min2_extra_valid: Optional[torch.Tensor] = None
-    _unionfb_is_fallback: Optional[torch.Tensor] = None
-
-    if set_label_mode == "minus_label":
-        # S_t' = S_t \ {y_t}
-        ext_ids = topk_ids_v                                             # [N, K_save]
-        ext_ref_logits = ref_topk_lg_v.float()                           # [N, K_save]
-        valid_ext = valid_top & (topk_ids_v != labels_v.unsqueeze(-1))   # [N, K_save]
-
-    elif set_label_mode == "minusy_min2":
-        # S_t' = S_t \ {y_t}, but if |S_t'| < 2, extend beyond k_t using the saved
-        # K_save buffer (still excluding y_t) until we have at least 2 non-label tokens.
-        # NOTE: this also expands positions where S_t = {y_t} (k=1, label-only set),
-        # borrowing rank-2/3 tokens from K_save even when the reference assigns them
-        # near-zero probability. For a stricter version that skips those positions,
-        # use set_label_mode='minusY_min2_strict'.
-        valid_nonlabel = topk_ids_v != labels_v.unsqueeze(-1)            # [N, K_save] – no k_v gate
-        valid_minus = valid_top & valid_nonlabel                         # [N, K_save]
-        set_size_minus = valid_minus.sum(-1, keepdim=True)               # [N, 1]
-        needs_expansion = set_size_minus < 2                             # [N, 1]
-        # Slots beyond k_v (within K_save) that are non-label: used for fallback
-        beyond_kv = ~valid_top                                           # [N, K_save]
-        extra_valid = needs_expansion & beyond_kv & valid_nonlabel       # [N, K_save]
-
-        ext_ids = topk_ids_v                                             # [N, K_save]
-        ext_ref_logits = ref_topk_lg_v.float()                           # [N, K_save]
-        valid_ext = valid_minus | extra_valid                            # [N, K_save]
-
-        _min2_needs_expansion = needs_expansion.squeeze(-1)              # [N]
-        _min2_extra_valid = extra_valid                                  # [N, K_save]
-
-    elif set_label_mode == "minusy_min2_strict":
-        # S_t' = S_t \ {y_t}, extended to >= 2 non-label tokens ONLY when there is
-        # already exactly 1 genuine non-label token in S_t (i.e. set_size_minus == 1).
-        # When S_t = {y_t} (set_size_minus == 0), L_lp_sft = 0, same as minus_label.
-        # This avoids borrowing near-zero-probability rank-2/3 tokens for label-only sets.
-        valid_nonlabel = topk_ids_v != labels_v.unsqueeze(-1)            # [N, K_save]
-        valid_minus = valid_top & valid_nonlabel                         # [N, K_save]
-        set_size_minus = valid_minus.sum(-1, keepdim=True)               # [N, 1]
-        needs_expansion = set_size_minus == 1                            # [N, 1] — only when 1 real alt
-        beyond_kv = ~valid_top                                           # [N, K_save]
-        extra_valid = needs_expansion & beyond_kv & valid_nonlabel       # [N, K_save]
-
-        ext_ids = topk_ids_v                                             # [N, K_save]
-        ext_ref_logits = ref_topk_lg_v.float()                           # [N, K_save]
-        valid_ext = valid_minus | extra_valid                            # [N, K_save]
-
-        _min2_needs_expansion = needs_expansion.squeeze(-1)              # [N]
-        _min2_extra_valid = extra_valid                                  # [N, K_save]
-
-    elif set_label_mode == "minusy_union_fallback":
-        # Default: S_t' = S_t \ {y_t}  (same as minus_label)
-        # Fallback: when |S_t| == 2 AND y_t ∈ S_t, use S_t' = S_t (keep y_t in set)
-        # to avoid the common {y_t, v} → degenerate single-token situation.
-        is_fallback = (k_v == 2) & label_in_set                         # [N]
-        valid_minus = valid_top & (topk_ids_v != labels_v.unsqueeze(-1)) # [N, K_save]
-        valid_union = valid_top                                          # [N, K_save]
-        valid_ext = torch.where(
-            is_fallback.unsqueeze(-1), valid_union, valid_minus
-        )                                                                # [N, K_save]
-
-        ext_ids = topk_ids_v                                             # [N, K_save]
-        ext_ref_logits = ref_topk_lg_v.float()                           # [N, K_save]
-        _unionfb_is_fallback = is_fallback                               # [N]
-
-    else:
-        # union_label and minus_anchor share the same buffer (label kept in S_t').
-        label_col_ids = labels_v.unsqueeze(-1)                           # [N, 1]
-        label_col_logit = ref_label_lg_v.float().unsqueeze(-1)           # [N, 1]
-        ext_ids = torch.cat([topk_ids_v, label_col_ids], dim=-1)       # [N, K_save+1]
-        ext_ref_logits = torch.cat(
-            [ref_topk_lg_v.float(), label_col_logit], dim=-1
-        )                                                                # [N, K_save+1]
-        valid_last = (~label_in_set).unsqueeze(-1)                       # [N, 1]
-        valid_ext = torch.cat([valid_top, valid_last], dim=-1)           # [N, K_save+1]
+    ext_ids, ext_ref_logits, valid_ext, _top1_picked_slot = build_lp_sft_set_mask(
+        topk_ids_v, ref_topk_lg_v, labels_v, k_v, K_save,
+    )
+    _top1_expanded = (
+        _top1_picked_slot.ge(0) if _top1_picked_slot is not None else None
+    )
 
     set_size = valid_ext.sum(dim=-1).long()                              # [N]   |S_t'|
 
     # ---- gather student logits at ext_ids ----
-    student_set_logits = logits_v_f.gather(-1, ext_ids)                   # [N, K_save+1]
+    student_set_logits = logits_v_f.gather(-1, ext_ids)                   # [N, K_save]
 
     NEG_INF = float("-inf")
 
-    # ---- minus_anchor only: stop-grad y_t logit so CE term owns y_t exclusively.
-    if set_label_mode == "minus_anchor":
-        is_label_pos = (ext_ids == labels_v.unsqueeze(-1)) & valid_ext   # [N, W]
-        student_set_logits = torch.where(
-            is_label_pos, student_set_logits.detach(), student_set_logits
-        )
-
     # ---- masked log_softmax for student over S_t' ----
     student_set_logits_masked = student_set_logits.masked_fill(~valid_ext, NEG_INF)
-    student_log_probs_S = F.log_softmax(student_set_logits_masked, dim=-1)  # [N, K_save+1]
+    student_log_probs_S = F.log_softmax(student_set_logits_masked, dim=-1)  # [N, K_save]
 
     # ---- masked softmax for ref over S_t' (with temperature) ----
     ref_set_scaled        = ext_ref_logits / float(tau)
     ref_set_scaled_masked = ref_set_scaled.masked_fill(~valid_ext, NEG_INF)
-    ref_probs_S           = F.softmax(ref_set_scaled_masked, dim=-1).detach()  # [N, K_save+1]
+    ref_probs_S           = F.softmax(ref_set_scaled_masked, dim=-1).detach()  # [N, K_save]
 
     # ---- in-set cross entropy: H(q_ref^S, p_theta^S) ----
     # Avoid 0 * -inf NaN at masked-out slots by zeroing student log_probs there.
@@ -397,11 +360,6 @@ def lp_sft_loss(
         kl_per_token = (kl_terms * valid_ext.float()).sum(-1)                    # [N]
 
         set_size_f = set_size.float()
-        _MODE_ENC = {
-            "union_label": 0.0, "minus_label": 1.0, "minus_anchor": 2.0,
-            "minusy_min2": 3.0, "minusy_union_fallback": 4.0,
-            "minusy_min2_strict": 5.0,
-        }
         diag: Dict[str, float] = {
             "lp_sft/loss":                 loss_per_token.mean().item(),
             "lp_sft/ce_loss":              ce_per_token.mean().item(),
@@ -423,21 +381,15 @@ def lp_sft_loss(
             "lp_sft/mu":                   float(mu),
             "lp_sft/tau":                  float(tau),
             "lp_sft/r_weight":             {"none": 0.0, "r": 1.0, "r2": 2.0, "r3": 3.0}[r_weight],
-            "lp_sft/set_label_mode":       _MODE_ENC[set_label_mode],
         }
-        # Mode-specific diagnostics
-        if _min2_needs_expansion is not None:
-            added = _min2_extra_valid.sum(-1).float()               # [N]
-            fallback_mask = _min2_needs_expansion                   # [N] bool
-            diag["lp_sft/min2_fallback_ratio"]  = fallback_mask.float().mean().item()
-            diag["lp_sft/min2_success_ratio"]   = (
-                (set_size >= 2) & fallback_mask
-            ).float().sum().item() / (fallback_mask.float().sum().item() + 1e-9)
-            diag["lp_sft/mean_added_tokens"]    = (
-                added[fallback_mask].mean().item() if fallback_mask.any() else 0.0
-            )
-        if _unionfb_is_fallback is not None:
-            diag["lp_sft/union_fallback_ratio"] = _unionfb_is_fallback.float().mean().item()
+        # Top-1 expansion diagnostics
+        if _top1_expanded is not None:
+            diag["lp_sft/top1_expand_ratio"] = _top1_expanded.float().mean().item()
+            if _top1_picked_slot is not None:
+                picked = _top1_picked_slot.ge(0)
+                diag["lp_sft/top1_success_ratio"] = (
+                    (set_size >= 2) & picked
+                ).float().sum().item() / (picked.float().sum().item() + 1e-9)
         if R_v is not None:
             diag["lp_sft/R_mean"] = R_v.float().mean().item()
             diag["lp_sft/R2_mean"] = R_v.float().pow(2).mean().item()
@@ -466,7 +418,6 @@ def lp_sft_loss_diagnostics(
     mu: float = 0.03,
     tau: float = 1.0,
     r_weight: str = "none",
-    set_label_mode: str = "union_label",
     K_save: int = 10,
     ignore_index: int = -100,
     loss_mode: str = "additive",
@@ -492,83 +443,28 @@ def lp_sft_loss_diagnostics(
     k_v             = shift_k[mask]
     topk_ids_v      = shift_topk_ids[mask]
     ref_topk_lg_v   = shift_ref_topk_lg[mask]
-    ref_label_lg_v  = shift_ref_label_lg[mask]
     R_v             = shift_R[mask].float() if shift_R is not None else None
 
-    N = labels_v.size(0)
     device = labels_v.device
     logits_v_f = logits_v.float()
     log_probs_full = F.log_softmax(logits_v_f, dim=-1)
     real_logp = log_probs_full.gather(-1, labels_v.unsqueeze(-1)).squeeze(-1)
     ce_per_token = -real_logp
 
-    set_label_mode = str(set_label_mode).lower()
-    _VALID_SET_LABEL_MODES = {
-        "union_label", "minus_label", "minus_anchor",
-        "minusy_min2", "minusy_min2_strict", "minusy_union_fallback",
-    }
-    if set_label_mode not in _VALID_SET_LABEL_MODES:
-        raise ValueError(
-            f"set_label_mode must be one of {sorted(_VALID_SET_LABEL_MODES)}, "
-            f"got {set_label_mode}"
-        )
-
     pos = torch.arange(K_save, device=device).unsqueeze(0)
     valid_top = pos < k_v.clamp(min=0).unsqueeze(-1)
-    match = (topk_ids_v == labels_v.unsqueeze(-1)) & valid_top
-    label_in_set = match.any(dim=-1)
+    label_in_set = ((topk_ids_v == labels_v.unsqueeze(-1)) & valid_top).any(dim=-1)
 
-    _min2_needs_expansion: Optional[torch.Tensor] = None
-    _min2_extra_valid: Optional[torch.Tensor] = None
-    _unionfb_is_fallback: Optional[torch.Tensor] = None
-
-    if set_label_mode == "minus_label":
-        ext_ids = topk_ids_v
-        ext_ref_logits = ref_topk_lg_v.float()
-        valid_ext = valid_top & (topk_ids_v != labels_v.unsqueeze(-1))
-
-    elif set_label_mode in ("minusy_min2", "minusy_min2_strict"):
-        valid_nonlabel = topk_ids_v != labels_v.unsqueeze(-1)
-        valid_minus = valid_top & valid_nonlabel
-        set_size_minus = valid_minus.sum(-1, keepdim=True)
-        if set_label_mode == "minusy_min2":
-            needs_expansion = set_size_minus < 2       # expand when 0 or 1 non-label tokens
-        else:
-            needs_expansion = set_size_minus == 1      # strict: expand only when 1 real alt
-        beyond_kv = ~valid_top
-        extra_valid = needs_expansion & beyond_kv & valid_nonlabel
-        ext_ids = topk_ids_v
-        ext_ref_logits = ref_topk_lg_v.float()
-        valid_ext = valid_minus | extra_valid
-        _min2_needs_expansion = needs_expansion.squeeze(-1)
-        _min2_extra_valid = extra_valid
-
-    elif set_label_mode == "minusy_union_fallback":
-        is_fallback = (k_v == 2) & label_in_set
-        valid_minus = valid_top & (topk_ids_v != labels_v.unsqueeze(-1))
-        valid_union = valid_top
-        valid_ext = torch.where(is_fallback.unsqueeze(-1), valid_union, valid_minus)
-        ext_ids = topk_ids_v
-        ext_ref_logits = ref_topk_lg_v.float()
-        _unionfb_is_fallback = is_fallback
-
-    else:
-        label_col_ids = labels_v.unsqueeze(-1)
-        label_col_logit = ref_label_lg_v.float().unsqueeze(-1)
-        ext_ids = torch.cat([topk_ids_v, label_col_ids], dim=-1)
-        ext_ref_logits = torch.cat([ref_topk_lg_v.float(), label_col_logit], dim=-1)
-        valid_last = (~label_in_set).unsqueeze(-1)
-        valid_ext = torch.cat([valid_top, valid_last], dim=-1)
+    ext_ids, ext_ref_logits, valid_ext, _top1_picked_slot = build_lp_sft_set_mask(
+        topk_ids_v, ref_topk_lg_v, labels_v, k_v, K_save,
+    )
+    _top1_expanded = (
+        _top1_picked_slot.ge(0) if _top1_picked_slot is not None else None
+    )
     set_size = valid_ext.sum(dim=-1).long()
 
     student_set_logits = logits_v_f.gather(-1, ext_ids)
     NEG_INF = float("-inf")
-
-    if set_label_mode == "minus_anchor":
-        is_label_pos = (ext_ids == labels_v.unsqueeze(-1)) & valid_ext
-        student_set_logits = torch.where(
-            is_label_pos, student_set_logits.detach(), student_set_logits
-        )
 
     student_log_probs_S = F.log_softmax(
         student_set_logits.masked_fill(~valid_ext, NEG_INF), dim=-1
@@ -622,11 +518,6 @@ def lp_sft_loss_diagnostics(
     kl_per_token = (kl_terms * valid_ext.float()).sum(-1)
 
     set_size_f = set_size.float()
-    _MODE_ENC = {
-        "union_label": 0.0, "minus_label": 1.0, "minus_anchor": 2.0,
-        "minusy_min2": 3.0, "minusy_union_fallback": 4.0,
-        "minusy_min2_strict": 5.0,
-    }
     out = {
         "lp_sft/loss":                 total_per_token.mean().item(),
         "lp_sft/ce_loss":              ce_per_token.mean().item(),
@@ -648,20 +539,14 @@ def lp_sft_loss_diagnostics(
         "lp_sft/mu":                   float(mu),
         "lp_sft/tau":                  float(tau),
         "lp_sft/r_weight":             {"none": 0.0, "r": 1.0, "r2": 2.0, "r3": 3.0}[r_weight],
-        "lp_sft/set_label_mode":       _MODE_ENC[set_label_mode],
     }
-    if _min2_needs_expansion is not None:
-        added = _min2_extra_valid.sum(-1).float()
-        fallback_mask = _min2_needs_expansion
-        out["lp_sft/min2_fallback_ratio"]  = fallback_mask.float().mean().item()
-        out["lp_sft/min2_success_ratio"]   = (
-            (set_size >= 2) & fallback_mask
-        ).float().sum().item() / (fallback_mask.float().sum().item() + 1e-9)
-        out["lp_sft/mean_added_tokens"]    = (
-            added[fallback_mask].mean().item() if fallback_mask.any() else 0.0
-        )
-    if _unionfb_is_fallback is not None:
-        out["lp_sft/union_fallback_ratio"] = _unionfb_is_fallback.float().mean().item()
+    if _top1_expanded is not None:
+        out["lp_sft/top1_expand_ratio"] = _top1_expanded.float().mean().item()
+    if _top1_picked_slot is not None:
+        picked = _top1_picked_slot.ge(0)
+        out["lp_sft/top1_success_ratio"] = (
+            (set_size >= 2) & picked
+        ).float().sum().item() / (picked.float().sum().item() + 1e-9)
     if R_v is not None:
         out["lp_sft/R_mean"] = R_v.float().mean().item()
         out["lp_sft/R2_mean"] = R_v.float().pow(2).mean().item()

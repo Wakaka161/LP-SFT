@@ -30,18 +30,9 @@ where:
     must be supplied by the caller (no forward inside this function).
 
 This is a verbatim port of the `mode == "asft"` branch of
-zhuchichi56/ASFT/train_v2.py, with one configurable choice:
-
-  reduction in ("mean_over_valid", "sum_div_num_items"):
-    "mean_over_valid"   -- ASFT paper convention: divide by the number of valid
-                           (non-ignored) tokens in the local batch.
-    "sum_div_num_items" -- HF Trainer convention: divide by num_items_in_batch
-                           (the global supervised-token count); needed to be
-                           comparable to other losses in this repo under
-                           gradient_accumulation_steps > 1.
-
-The default is "sum_div_num_items" (matches the rest of this repo); pass
-`reduction="mean_over_valid"` to reproduce the ASFT paper exactly.
+zhuchichi56/ASFT/train_v2.py. Batch reduction follows the HF Trainer
+convention used by all other losses in this repo: sum over valid tokens,
+divide by `num_items_in_batch` (global supervised-token count).
 
 ================================================================================
 SHIFT CONVENTION
@@ -87,7 +78,6 @@ def asft_loss(
     num_items_in_batch: Optional[torch.Tensor] = None,
     kl_weight: float = 0.03,
     ignore_index: int = -100,
-    reduction: str = "sum_div_num_items",
     return_diagnostics: bool = False,
     ref_topk: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, float]]]:
@@ -98,14 +88,11 @@ def asft_loss(
         labels:       gold labels    [B, L] (with `ignore_index` on prompt/padding).
         ref_logits:   frozen-base logits [B, L, V] (same shape as `logits`).
                       Caller is responsible for computing these under torch.no_grad().
-        num_items_in_batch: HF Trainer's global count of supervised tokens. Only
-                      used when reduction == "sum_div_num_items".
+        num_items_in_batch: HF Trainer's global count of supervised tokens.
         kl_weight:    anchoring strength lambda. Paper uses 0.05 (medical) / 0.1
                       (math); bf16-mixed-precision recommended setting per the
                       ASFT GitHub README is 0.03.
         ignore_index: label id to ignore (default -100).
-        reduction:    "sum_div_num_items" (default, HF Trainer convention) or
-                      "mean_over_valid" (ASFT paper convention).
         return_diagnostics: if True, also return a dict of `asft/...` scalars.
         ref_topk:     ablation knob (None = full vocabulary ASFT, default). When
                       set to an int K, the reference distribution is TRUNCATED to
@@ -130,12 +117,6 @@ def asft_loss(
             f"ref_logits shape {tuple(ref_logits.shape)} must match logits "
             f"shape {tuple(logits.shape)}"
         )
-    if reduction not in ("sum_div_num_items", "mean_over_valid"):
-        raise ValueError(
-            f"reduction must be 'sum_div_num_items' or 'mean_over_valid', "
-            f"got {reduction!r}"
-        )
-
     V = logits.size(-1)
 
     # ---- shift for next-token prediction (logits[:, t] predicts labels[:, t+1]) ----
@@ -206,13 +187,12 @@ def asft_loss(
     per_token_loss = dft_per_token + kl_weight * kl_per_token         # [N_all]
     masked_loss = per_token_loss[valid_mask]                          # [N_valid]
 
-    if reduction == "sum_div_num_items" and num_items_in_batch is not None:
+    if num_items_in_batch is not None:
         total_loss = masked_loss.sum()
         if torch.is_tensor(num_items_in_batch):
             num_items_in_batch = num_items_in_batch.to(total_loss.device)
         loss = total_loss / num_items_in_batch
     else:
-        # "mean_over_valid", or fallback when num_items_in_batch is None.
         loss = masked_loss.mean()
     loss = loss.to(logits.dtype) if logits.dtype != torch.float32 else loss
 
