@@ -79,10 +79,10 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Ref top-K cap |S_t'| <= K_save. Must match precompute cache K_save."}
     )
     lp_sft_mu: float = field(
-        default=0.03,
-        metadata={"help": "Weight on the in-set ref-soft-CE term: "
-                          "L = CE + mu * H(q_ref^S, p_theta^S). "
-                          "Recommended sweep (tau=1.0): {0.01, 0.03, 0.05, 0.1}."}
+        default=1.0,
+        metadata={"help": "Preservation weight mu on the local KL term: "
+                          "L = CE + mu * KL(q_hat || p_hat) over A_t. "
+                          "Paper default: mu=1."}
     )
     lp_sft_tau: float = field(
         default=1.0,
@@ -111,14 +111,13 @@ class TrainingArguments(transformers.TrainingArguments):
                           "Selects k_n2 or k_n1 from cache (falls back to legacy 'k' if missing)."}
     )
     lp_sft_k_round_mode: str = field(
-        default="precomputed",
-        metadata={"help": "How to derive k from the cache: "
-                          "'precomputed' (default) – use stored k_n1/k_n2/k; "
-                          "'round' – recompute from raw n1_vals/n2_vals using mathematical rounding; "
-                          "'ceil'  – recompute using ceiling (legacy behavior); "
-                          "'floor' – recompute using floor. "
-                          "Requires cache produced with --save_topk (n1_vals/n2_vals fields). "
-                          "Falls back to stored k if raw vals are absent."}
+        default="max",
+        metadata={"help": "How to derive k_t from the cache: "
+                          "'max' (paper default) – fixed k_t = K_save for every token; "
+                          "'precomputed' – use stored k_n1/k_n2/k (N-adaptive ablation); "
+                          "'round'/'ceil'/'floor' – recompute from raw n1_vals/n2_vals. "
+                          "Adaptive modes need cache fields n1_vals/n2_vals; "
+                          "fall back to stored k if raw vals are absent."}
     )
     lp_sft_k_threshold: float = field(
         default=0.0,
@@ -226,7 +225,7 @@ class CustomDataset(Dataset):
         plateau_K_save: int = 10,
         attach_ref_align: bool = False,
         set_method: str = "N2",
-        k_round_mode: str = "precomputed",
+        k_round_mode: str = "max",
         k_threshold: float = 0.0,
     ):
         self.training_args = training_args
@@ -418,7 +417,7 @@ def main():
         plateau_K_save=training_args.plateau_K_save,
         attach_ref_align=use_lp_sft_cache,
         set_method=getattr(training_args, "lp_sft_set_method", "N2"),
-        k_round_mode=getattr(training_args, "lp_sft_k_round_mode", "precomputed"),
+        k_round_mode=getattr(training_args, "lp_sft_k_round_mode", "max"),
         k_threshold=getattr(training_args, "lp_sft_k_threshold", 0.0),
     )
     if data_args.test_tokenized_file:

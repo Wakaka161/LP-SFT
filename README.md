@@ -2,7 +2,7 @@
 
 Official **training** code for **LP-SFT**.
 
-LP-SFT augments standard supervised fine-tuning with a local KL anchor against the frozen base model, preserving the base model's relative preferences over an adaptively chosen set of non-target alternatives.
+LP-SFT augments standard supervised fine-tuning with a local KL anchor against the frozen base model, preserving the base model's relative preferences over a fixed local top-$K$ set of non-target alternatives ($K_{\max}=10$, $\mu=1$ by default).
 
 ## Quick Start
 
@@ -24,9 +24,9 @@ bash scripts/qwen3-4b/train.sh magicoder ce
 ASFT_KL_WEIGHT=0.05 bash scripts/qwen3-4b/train.sh magicoder asft
 
 # 4b. LP-SFT — precompute, then train
-SAVE_TOPK=1 SAVE_REF_LOGITS=1 K_SAVE=10 SET_METHOD=N1 \
+SAVE_TOPK=1 SAVE_REF_LOGITS=1 K_SAVE=10 \
     bash scripts/qwen3-4b/precompute.sh magicoder
-bash scripts/qwen3-4b/train.sh magicoder lp_sft          # default LP_SFT_MU=0.03
+bash scripts/qwen3-4b/train.sh magicoder lp_sft          # default: μ=1, fixed top-10
 ```
 
 **Smoke test** (one GPU; Qwen3-4B × magicoder):
@@ -68,7 +68,7 @@ bash scripts/<model>/train.sh <dataset> <loss>
 
 `scripts/qwen3-4b/`、`scripts/qwen3-14b/`、`scripts/llama3.1/` 为各模型薄封装。
 
-Key env vars: `LP_SFT_MU` (default `0.03`), `ASFT_KL_WEIGHT` (default `0.05`).
+Key env vars: `LP_SFT_MU` (default `1`, paper), `LP_SFT_K_ROUND_MODE` (default `max` = fixed top-10), `ASFT_KL_WEIGHT` (default `0.05`).
 
 ## Data & Models
 

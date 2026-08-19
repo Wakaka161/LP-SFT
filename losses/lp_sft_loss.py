@@ -192,7 +192,7 @@ def lp_sft_loss(
     ref_label_logit: torch.Tensor,                 # [B, L]               float
     renyi_R: Optional[torch.Tensor] = None,         # [B, L]               float, optional R_t
     num_items_in_batch: Optional[torch.Tensor] = None,
-    mu: float = 0.03,
+    mu: float = 1.0,
     tau: float = 1.0,
     r_weight: str = "none",                         # none | R | R2 | R3
     K_save: int = 10,
@@ -415,7 +415,7 @@ def lp_sft_loss_diagnostics(
     ref_topk_logits: torch.Tensor,
     ref_label_logit: torch.Tensor,
     renyi_R: Optional[torch.Tensor] = None,
-    mu: float = 0.03,
+    mu: float = 1.0,
     tau: float = 1.0,
     r_weight: str = "none",
     K_save: int = 10,

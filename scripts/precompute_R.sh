@@ -66,9 +66,9 @@ if [ "$SET_METHOD" != "N2" ] && [ "$SET_METHOD" != "N1" ]; then
     echo "ERROR: SET_METHOD must be N1 or N2, got $SET_METHOD" >&2
     exit 1
 fi
-# MAX_SEQ_LEN: 截断长度 (默认 4096，与 tokenized 数据一致).
+# MAX_SEQ_LEN: 截断长度 (默认 2048，与训练 max_seq_length 一致).
 # 若显式传入 0 则表示不截断.
-MAX_SEQ_LEN="${MAX_SEQ_LEN:-4096}"
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
 
 [ -f "$MODEL_PATH/config.json" ] || { echo "ERROR: model not found at $MODEL_PATH" >&2; exit 1; }
 [ -f "$DATA_FILE" ] || { echo "ERROR: data file not found at $DATA_FILE" >&2; exit 1; }

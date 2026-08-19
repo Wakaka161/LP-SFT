@@ -74,8 +74,8 @@ def parse_args():
                     help="只算前 N 个 sample (None=全量). 训练用 100K, 应跟 SMOKE/full 对齐.")
     ap.add_argument("--topk", type=int, default=30,
                     help="top-K 用于近似 H1/H2 (默认 30, 跟 analysis pipeline 一致)")
-    ap.add_argument("--max_seq_len", type=int, default=4096,
-                    help="截断长度, 跟 tokenize_sft.py 的 MAX_SEQ_LENGTH 一致 (默认 4096)")
+    ap.add_argument("--max_seq_len", type=int, default=2048,
+                    help="截断长度, 须与训练 max_seq_length / tokenized 数据一致 (默认 2048)")
     ap.add_argument("--ignore_index", type=int, default=-100)
     ap.add_argument("--flush_every", type=int, default=200,
                     help="每写多少 sample flush 一次 (防 OOM/crash)")

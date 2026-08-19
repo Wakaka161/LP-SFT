@@ -87,14 +87,16 @@ def load_R_cache(path: str) -> Dict[int, Dict[str, list]]:
 def select_k_for_set_method(
     entry: Dict[str, list],
     set_method: str = "N2",
-    k_round_mode: str = "precomputed",
+    k_round_mode: str = "max",
     k_save: int = 10,
     k_threshold: float = 0.0,
 ) -> list:
     """Return the k list from *entry* that matches *set_method*.
 
     k_round_mode controls how k is derived:
-      'precomputed'  – use the stored k_n1/k_n2/k field (default, backward-compat).
+      'max'          – force k_t = k_save for EVERY token (paper default: fixed top-K).
+                       Independent of N1/N2; only needs entry length (via 'R' or topk rows).
+      'precomputed'  – use the stored k_n1/k_n2/k field (backward-compat / N-adaptive ablation).
       'ceil'         – recompute from raw n1_vals/n2_vals using ceil.
       'round'        – recompute from raw n1_vals/n2_vals using round (half-to-even).
       'floor'        – recompute from raw n1_vals/n2_vals using floor (≥1).
@@ -104,8 +106,8 @@ def select_k_for_set_method(
       (treated as "almost certain"), remaining tokens use ceil.
       Overrides k_round_mode when active.
 
-    When k_round_mode != 'precomputed', n1_vals/n2_vals must be present in entry.
-    Falls back silently to stored k if the raw vals are missing.
+    When k_round_mode in {'ceil', 'round', 'floor'}, n1_vals/n2_vals must be present
+    in entry; falls back silently to stored k if the raw vals are missing.
     """
     import math
 
@@ -122,10 +124,30 @@ def select_k_for_set_method(
         return [1 if v < threshold else max(1, min(k_save, math.ceil(v)))
                 for v in vals]
 
+    def _seq_len() -> int:
+        if "R" in entry:
+            return len(entry["R"])
+        if "topk_ids" in entry:
+            return len(entry["topk_ids"])
+        if "k" in entry:
+            return len(entry["k"])
+        if "k_n2" in entry:
+            return len(entry["k_n2"])
+        if "k_n1" in entry:
+            return len(entry["k_n1"])
+        raise ValueError(
+            "k_round_mode='max' needs a length field in cache "
+            "('R', 'topk_ids', or 'k'/'k_n1'/'k_n2')."
+        )
+
     if k_threshold > 1.0:
         n_key = "n1_vals" if set_method == "N1" else "n2_vals"
         if n_key in entry:
             return _apply_threshold(entry[n_key], k_threshold)
+
+    # Paper default: fixed top-K_max for every token.
+    if k_round_mode == "max":
+        return [int(k_save)] * _seq_len()
 
     if k_round_mode != "precomputed":
         n_key = "n1_vals" if set_method == "N1" else "n2_vals"

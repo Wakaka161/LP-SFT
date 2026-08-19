@@ -17,23 +17,23 @@
 #   N_GPU=8                       → GPU 数, 默认自动检测
 #   GEM_BETA=0.7                  → GEM 超参 (仅 loss=gem 用)
 #   PLATEAU_K_SAVE=10             → lp_sft cache |S_t'| 上限 (默认 10, 必须等于 cache K_save)
-#   LP_SFT_MU=0.03           → lp_sft 第二项权重 (默认 0.03, 推荐扫 {0.01,0.03,0.05,0.1})
+#   LP_SFT_MU=1                   → lp_sft 保留项权重 μ (论文默认 1; ASFT 的 KL 权重是 ASFT_KL_WEIGHT)
 #   LP_SFT_TAU=1.0           → lp_sft reference 温度 (默认 1.0, 第一阶段固定; 后续可扫 {1.0,1.5,2.0})
 #   LP_SFT_R_WEIGHT=none|R|R2|R3 → lp_sft 第二项权重: mu, mu*R_t, mu*R_t^2, 或 mu*R_t^3 (默认 none)
-#   LP_SFT_SET_METHOD=N2|N1        → 训练时从 cache 读 k_n2 (默认) 或 k_n1
-#                                   precompute 请用 SET_METHOD=N1 (文件名带 _setN1)
-#   LP_SFT_K_ROUND_MODE=precomputed|round|ceil|floor
+#   LP_SFT_SET_METHOD=N2|N1        → N-adaptive 消融时从 cache 读 k_n2 / k_n1
+#                                   (仅当 LP_SFT_K_ROUND_MODE≠max 时生效)
+#   LP_SFT_K_ROUND_MODE=max|precomputed|round|ceil|floor
 #                                 → 如何从 cache 导出 k_t:
-#                                   precomputed (默认) 直接用 cache 里存的 k_n1/k_n2/k;
-#                                   round/ceil/floor  从 cache 里的 n1_vals/n2_vals 原生值重新计算,
-#                                   无需重跑 precompute_R.
+#                                   max (论文默认) 每个 token 固定 k_t=K_save (fixed top-10);
+#                                   precomputed 直接用 cache 里存的 k_n1/k_n2/k (N-adaptive);
+#                                   round/ceil/floor  从 cache 里的 n1_vals/n2_vals 重新计算.
 #   LP_SFT_K_THRESHOLD=1.2         → 阈值 T (>1.0 时启用): n<T → k=1, else k=ceil(n).
 #                                   覆盖 LP_SFT_K_ROUND_MODE. 推荐扫 {1.1, 1.2, 1.3}.
 #   LP_SFT_MODE=additive|r_interp → lp_sft combination mode
 #                                         additive: CE + mu*L_set (default)
 #                                         r_interp: (1-R)*CE + R*L_set (convex interp, ignores mu/r_weight)
 #   R_CACHE_PATH=...              → cache 路径 (覆盖默认自动推导)
-#   ASFT_KL_WEIGHT=0.05           → ASFT KL anchor λ (default 0.05)
+#   ASFT_KL_WEIGHT=0.05           → ASFT KL anchor λ (default 0.05; 不是 LP-SFT 的 μ)
 #   ZERO_STAGE=2|3                → DeepSpeed ZeRO (asft auto-selects 3)
 #   R_BASE_MODEL=qwen3_4b_base    → cache 是用哪个 base 模型算的 (默认从 MODEL_TAG 推导)
 
@@ -198,9 +198,9 @@ ASFT_KL_WEIGHT="${ASFT_KL_WEIGHT:-0.05}"
 PLATEAU_K_SAVE="${PLATEAU_K_SAVE:-10}"
 
 # ---------- LP-SFT loss CE 超参 ----------
-# mu:  weight on H(q_ref^S, p_theta^S) (CE + mu * set_loss). Default 0.03; sweep {0.01,0.03,0.05,0.1}.
+# mu:  preservation weight on local KL (CE + mu * set_loss). Paper default: 1.
 # tau: temperature applied to ref logits before in-set softmax. Default 1.0; later sweep {1.0,1.5,2.0}.
-LP_SFT_MU="${LP_SFT_MU:-0.03}"
+LP_SFT_MU="${LP_SFT_MU:-1}"
 LP_SFT_TAU="${LP_SFT_TAU:-1.0}"
 LP_SFT_R_WEIGHT="${LP_SFT_R_WEIGHT:-none}"
 case "$(echo "$LP_SFT_R_WEIGHT" | tr '[:upper:]' '[:lower:]')" in
@@ -215,10 +215,10 @@ if [ "$LP_SFT_SET_METHOD" != "N2" ] && [ "$LP_SFT_SET_METHOD" != "N1" ]; then
     echo "ERROR: LP_SFT_SET_METHOD must be N1 or N2, got $LP_SFT_SET_METHOD" >&2
     exit 1
 fi
-LP_SFT_K_ROUND_MODE="${LP_SFT_K_ROUND_MODE:-precomputed}"
+LP_SFT_K_ROUND_MODE="${LP_SFT_K_ROUND_MODE:-max}"
 case "$LP_SFT_K_ROUND_MODE" in
-    precomputed|round|ceil|floor) ;;
-    *) echo "ERROR: LP_SFT_K_ROUND_MODE must be precomputed|round|ceil|floor, got $LP_SFT_K_ROUND_MODE" >&2; exit 1 ;;
+    max|precomputed|round|ceil|floor) ;;
+    *) echo "ERROR: LP_SFT_K_ROUND_MODE must be max|precomputed|round|ceil|floor, got $LP_SFT_K_ROUND_MODE" >&2; exit 1 ;;
 esac
 LP_SFT_K_THRESHOLD="${LP_SFT_K_THRESHOLD:-0}"
 LP_SFT_MODE="${LP_SFT_MODE:-additive}"
@@ -286,8 +286,12 @@ elif [ "$LOSS" = "lp_sft" ]; then
     if [ "$LP_SFT_MODE" = "r_interp" ]; then
         LOSS_TAG="${LOSS_TAG}_rinterp"
     fi
-    if [ "$LP_SFT_SET_METHOD" = "N1" ]; then
-        LOSS_TAG="${LOSS_TAG}_setN1"
+    # Paper default is fixed top-K (max); tag only non-default / adaptive schedules.
+    if [ "$LP_SFT_K_ROUND_MODE" != "max" ]; then
+        LOSS_TAG="${LOSS_TAG}_k${LP_SFT_K_ROUND_MODE}"
+        if [ "$LP_SFT_SET_METHOD" = "N1" ]; then
+            LOSS_TAG="${LOSS_TAG}_setN1"
+        fi
     fi
     if [ -n "$LP_SFT_K_THRESHOLD" ] && [ "$LP_SFT_K_THRESHOLD" != "0" ]; then
         _thr_gt=$(python3 -c "print(1 if float('$LP_SFT_K_THRESHOLD')>1.0 else 0)" 2>/dev/null || echo "$(echo "$LP_SFT_K_THRESHOLD > 1.0" | bc -l 2>/dev/null || echo 0)")
@@ -331,13 +335,17 @@ if [ "$LOSS" = "asft" ]; then
     echo "[train] note           = L = DFT + lambda * KL(pi_ref || pi_theta); live ref forward, no cache."
 fi
 if [ "$LOSS" = "lp_sft" ]; then
-    echo "[train] lp_sft_mu      = $LP_SFT_MU  (weight on H(q_ref^S, p_theta^S))"
+    echo "[train] lp_sft_mu      = $LP_SFT_MU  (preservation weight μ; paper default 1)"
     echo "[train] lp_sft_tau     = $LP_SFT_TAU (ref temperature for q_ref^S)"
     echo "[train] lp_sft_r_weight= $LP_SFT_R_WEIGHT (none: mu; R: mu*R_t; R2: mu*R_t^2; R3: mu*R_t^3)"
     echo "[train] lp_sft_mode     = $LP_SFT_MODE (additive: CE+mu*L_set; r_interp: (1-R)*CE+R*L_set)"
     echo "[train] lp_sft_set        = S_t \\ {y_t}; |S'|==1 → add top-1 ref alt from cache"
-    echo "[train] lp_sft_set_method    = $LP_SFT_SET_METHOD (k_t = clamp($LP_SFT_K_ROUND_MODE($LP_SFT_SET_METHOD), 1, K))"
-    echo "[train] lp_sft_k_round_mode  = $LP_SFT_K_ROUND_MODE"
+    echo "[train] lp_sft_k_round_mode  = $LP_SFT_K_ROUND_MODE  (max = fixed top-K_save)"
+    if [ "$LP_SFT_K_ROUND_MODE" = "max" ]; then
+        echo "[train] lp_sft_set_method    = (ignored under max; k_t = K_save=$PLATEAU_K_SAVE)"
+    else
+        echo "[train] lp_sft_set_method    = $LP_SFT_SET_METHOD (k_t = clamp($LP_SFT_K_ROUND_MODE($LP_SFT_SET_METHOD), 1, K))"
+    fi
     echo "[train] lp_sft_k_threshold   = $LP_SFT_K_THRESHOLD  (>1.0: n<T→k=1, else ceil)"
     echo "[train] plateau_K_save      = $PLATEAU_K_SAVE  (cache size, |S_t| upper bound)"
     echo "[train] cache               = $R_CACHE_PATH"

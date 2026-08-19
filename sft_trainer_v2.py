@@ -128,7 +128,7 @@ class SFTTrainer(Trainer):
     def lp_sft_loss(self, logits, labels, plateau_k, plateau_topk_ids,
                                 ref_topk_logits, ref_label_logit,
                                 num_items_in_batch, renyi_R=None,
-                                mu=0.03, tau=1.0, r_weight="none",
+                                mu=1.0, tau=1.0, r_weight="none",
                                 K_save=10, ignore_index=-100,
                                 loss_mode="additive"):
         """Precomputed LP-SFT (lp_sft). See losses/lp_sft_loss.py.
